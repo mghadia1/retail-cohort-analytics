@@ -85,6 +85,60 @@ def test_monthly_kpis(con):
     assert jan["is_partial_month"]
 
 
+def test_cohort_retention(con):
+    cohorts = analysis.run(con, "cohort_retention")
+    cell = cohorts.set_index(["cohort_month", "months_since"])
+    jan = pd.Timestamp("2011-01-01")
+    feb = pd.Timestamp("2011-02-01")
+    assert cell.loc[(jan, 0), "cohort_size"] == 2
+    assert cell.loc[(jan, 1), "retention"] == pytest.approx(0.5)   # customer 1 only
+    assert cell.loc[(jan, 2), "retention"] == pytest.approx(0.5)
+    assert cell.loc[(feb, 1), "retention"] == pytest.approx(1.0)   # customer 3
+    assert not cohorts["is_partial_period"].any()                  # March ends on the 31st
+
+
+def test_partial_final_month_is_flagged(raw):
+    extra = raw.iloc[[0]].assign(invoice="112", invoice_date=pd.Timestamp("2011-04-09"))
+    cohorts = analysis.run(analysis.connect(pd.concat([raw, extra])), "cohort_retention")
+    # the data now stops on April 9, so the one cell landing in April is flagged
+    flagged = cohorts[cohorts["is_partial_period"]]
+    assert len(flagged) == 1
+    assert flagged.iloc[0]["cohort_month"] == pd.Timestamp("2011-01-01")
+    assert flagged.iloc[0]["months_since"] == 3
+
+
+def test_weighted_retention_skips_left_censored_first_cohort(con):
+    cohorts = analysis.run(con, "cohort_retention")
+    assert analysis.weighted_retention(cohorts, 1, skip_first_cohort=False) == pytest.approx(2 / 3)
+    assert analysis.weighted_retention(cohorts, 1) == pytest.approx(1.0)  # only the Feb cohort
+
+
+def test_rfm_scores_and_recency(con):
+    rfm = analysis.run(con, "rfm").set_index("customer_id")
+    assert rfm.loc[1, "frequency"] == 3
+    assert rfm.loc[1, "f_score"] > rfm.loc[3, "f_score"] > rfm.loc[2, "f_score"]
+    assert rfm.loc[1, "recency_days"] == 22            # last buy Mar 10, snapshot Apr 1
+    assert rfm.loc[3, "recency_days"] == 1
+
+
+def test_rfm_tied_frequencies_share_a_score():
+    rows = [line(str(i), "22423", 1, f"2011-01-{i + 1:02d}", 1.0, i) for i in range(1, 11)]
+    frame = pd.DataFrame(rows)
+    frame["customer_id"] = frame["customer_id"].astype("Int64")
+    rfm = analysis.run(analysis.connect(frame), "rfm")
+    # ten one-order customers: NTILE(5) would spread them over five scores
+    assert rfm["f_score"].nunique() == 1
+
+
+def test_revenue_concentration(con):
+    top = analysis.run(con, "revenue_concentration").set_index("top_pct")
+    # identified revenue: customer 1 = 60, customer 2 = 20, customer 3 = 40
+    assert top.loc[20, "customers"] == 1
+    assert top.loc[20, "revenue_share_pct"] == pytest.approx(50.0)
+    assert top.loc[50, "customers"] == 2
+    assert top.loc[50, "revenue_share_pct"] == pytest.approx(83.33, abs=0.01)
+
+
 def test_unknown_query_is_rejected(con):
     with pytest.raises(KeyError):
         analysis.run(con, "DROP TABLE lines")
